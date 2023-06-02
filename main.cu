@@ -4,10 +4,18 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <string>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+namespace cg = cooperative_groups;
 
-typedef unsigned long long int double_i;
-#define R2I(x) __double_as_longlong(x)
-#define I2R(x) __longlong_as_double(x)
+#if __CUDA_ARCH__ < 200
+#define CROSS_NEED_ATOMICADD
+#endif
+
+#ifdef CROSS_NEED_ATOMICADD
+	typedef unsigned long long int double_i;
+	#define R2I(x) __double_as_longlong(x)
+	#define I2R(x) __longlong_as_double(x)
 
   __device__ inline void atomicAddP(double* address, double val)
   {
@@ -22,14 +30,19 @@ typedef unsigned long long int double_i;
 		} while (assumed != old);
 	  }
   }
-
+#else
+	#define atomicAddP atomicAdd
+#endif
 __shared__ double  sumtab[256];
 
-__device__ inline void atomicSum_f(double * sum) {
+struct block_sum {
+__device__ static inline void atomicSum(double * sum, double val) {
 	int i = blockDim.x*blockDim.y;
 	int k = blockDim.x*blockDim.y;
 	int j = blockDim.x*threadIdx.y + threadIdx.x;
 	double v;
+	__syncthreads();
+	sumtab[j] = val;
 	while (i> 1) {
 		k = i >> 1;
 		i = i - k;
@@ -46,34 +59,100 @@ __device__ inline void atomicSum_f(double * sum) {
 		}
 	}
 }
+};
 
-__device__ inline void atomicSum(double * sum, double val)
+struct direct_sum {
+__device__ static inline void atomicSum(double * sum, double val)
 {
-	__syncthreads();
-	int j = blockDim.x*threadIdx.y + threadIdx.x;
-	sumtab[j] = val;
-	__syncthreads();
-	atomicSum_f(sum);
+	atomicAddP(sum,val);
 }
+};
+
+
+struct warp_sum {
+__device__ static inline void atomicSum(double * sum, double val)
+{
+	#define FULL_MASK 0xffffffff
+	for (int offset = 16; offset > 0; offset /= 2)
+	    val += __shfl_down_sync(FULL_MASK, val, offset);
+	if (threadIdx.x == 0) atomicAddP(sum,val);
+}
+};
+
+struct warp_any_sum {
+__device__ static inline void atomicSum(double * sum, double val)
+{
+	#define FULL_MASK 0xffffffff
+	if (__all_sync(FULL_MASK, val == 0.0)) return;
+	for (int offset = 16; offset > 0; offset /= 2)
+	    val += __shfl_down_sync(FULL_MASK, val, offset);
+	if (threadIdx.x == 0) atomicAddP(sum,val);
+}
+};
+
+struct warp_xor_any_sum {
+__device__ static inline void atomicSum(double * sum, double val)
+{
+	#define FULL_MASK 0xffffffff
+	if (__all_sync(FULL_MASK, val == 0.0)) return;
+	for (int offset = 16; offset > 0; offset /= 2)
+	    val += __shfl_xor_sync(FULL_MASK, val, offset);
+	if (threadIdx.x == 0) atomicAddP(sum,val);
+}
+};
+
+
+struct cg_block_sum {
+__device__ static inline void atomicSum(double * sum, double val) {
+	cg::coalesced_group active = cg::coalesced_threads();
+	//cg::thread_block active = cg::this_thread_block();
+	//cg::labeled_partition(active, sum);
+	double val2 = cg::reduce(active, val, cg::plus<double>());
+	if (active.thread_rank() == 0)  atomicAddP(sum,val2);
+}
+};
+
+
+struct cg_block_part_lab_sum {
+__device__ static inline void atomicSum(double * sum, double val) {
+	cg::coalesced_group active = cg::coalesced_threads();
+	cg::coalesced_group com = cg::labeled_partition(active, (unsigned long long)(void*)sum);
+	double val2 = cg::reduce(com, val, cg::plus<double>());
+	if (com.thread_rank() == 0)  atomicAddP(sum,val2);
+}
+};
+
+
+// struct cg_block_part_lab_sum_invoke {
+// __device__ static inline void atomicSum(double * sum, double val) {
+// 	cg::coalesced_group active = cg::coalesced_threads();
+// 	cg::coalesced_group com = cg::labeled_partition(active, (unsigned long long)(void*)sum);
+// 	cg::experimental::reduce_update_async(com, cuda::atomic(sum),val, cg::plus<double>());
+// 	//cg::invoke_one(com, atomicAddP, sum, val2);
+// }
+// };
+
 
 
 const int M = 10;
 
 __host__ __device__ int bin(double x) {
 	int i = floor(x*M);
-	if (i < 0) return 0;
+	if (i < 0) return -1;
 	if (i < M) return i;
-	return M-1;
+	return -1;
 }
 
-__global__ void test0(double* tab, int N, double * hist) {
+template < class T >
+__global__ void DirectCall(double* tab, int N, double * hist) {
 	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
 	int j = bin(tab[i]);
 	double val = 1.0;
-	atomicAddP(&hist[j],val);
+	if (j != -1) T::atomicSum(&hist[j],val);
 }
 
-__global__ void test1(double* tab, int N, double * hist) {
+template < class T >
+__global__ void ForCall(double* tab, int N, double * hist) {
 	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
 	int j = bin(tab[i]);
 	double val;
@@ -83,95 +162,17 @@ __global__ void test1(double* tab, int N, double * hist) {
 		} else {
 			val = 0.0;
 		}
-		atomicAddP(&hist[k],val);
+		T::atomicSum(&hist[k],val);
 	}
 }
-
-__global__ void test2(double* tab, int N, double * hist) {
-	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
-	double val;
-	for (int k=0; k<M; k++) {
-		if (j == k) {
-			val = 1.0;
-		} else {
-			val = 0.0;
-		}
-		atomicSum(&hist[k],val);
-	}
-}
-
-
-__device__ inline void atomicSumWarp(double * sum, double val)
-{
-	#define FULL_MASK 0xffffffff
-	for (int offset = 16; offset > 0; offset /= 2)
-	    val += __shfl_down_sync(FULL_MASK, val, offset);
-	if (threadIdx.x == 0) atomicAddP(sum,val);
-//	if (threadIdx.x == 0) *sum += val;
-}
-
-__global__ void test3(double* tab, int N, double * hist) {
-	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
-	double val;
-	for (int k=0; k<M; k++) {
-		if (j == k) {
-			val = 1.0;
-		} else {
-			val = 0.0;
-		}
-		atomicSumWarp(&hist[k],val);
-	}
-}
-
-__global__ void test4(double* tab, int N, double * hist) {
-	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
-	double val;
-	for (int k=0; k<M; k++) {
-		if (j == k) {
-			val = 1.0;
-		} else {
-			val = 0.0;
-		}
-		if (__any_sync(FULL_MASK, val != 0)) atomicSumWarp(&hist[k],val);
-	}
-}
-
-
-__device__ inline void atomicSumWarpX(double * sum, double val)
-{
-	#define FULL_MASK 0xffffffff
-	for (int offset = 16; offset > 0; offset /= 2)
-	    val += __shfl_xor_sync(FULL_MASK, val, offset);
-	if (threadIdx.x == 0) atomicAddP(sum,val);
-//	if (threadIdx.x == 0) *sum += val;
-}
-
-__global__ void test5(double* tab, int N, double * hist) {
-	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
-	double val;
-	for (int k=0; k<M; k++) {
-		if (j == k) {
-			val = 1.0;
-		} else {
-			val = 0.0;
-		}
-		if (__any_sync(FULL_MASK, val != 0)) atomicSumWarpX(&hist[k],val);
-	}
-}
-
 
 int main () {
-//	cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
 	srand(0);
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
 
-	int N = 1024000*2;
+	int N = 1024*1024*128;
 	double *tab;
 	double *gtab;
 	double *hist;
@@ -197,12 +198,14 @@ int main () {
 		for (int dist=0; dist<2; dist++) {
 			std::string dist_name;
 			switch (dist) {
-				case 0: dist_name = "rand"; for (int i=0; i<N; i++) tab[i] = 1.0*rand()/RAND_MAX; break;
-				case 1: dist_name = "unif"; for (int i=0; i<N; i++) tab[i] = 1.0*i/N; break;
+				case 0: dist_name = "rand"; for (int i=0; i<N; i++) tab[i] = 1.1*rand()/RAND_MAX; break;
+				case 1: dist_name = "unif"; for (int i=0; i<N; i++) tab[i] = 1.1*i/N; break;
 			}
 			for (int i=0; i<M; i++) chist[i] = 0;
-			for (int i=0; i<N; i++) chist[bin(tab[i])]++;
-			for (int test = 0; test < 6; test ++) {
+			int out=0;
+			for (int i=0; i<N; i++) { int j = bin(tab[i]); if (j != -1) chist[j]++; else out++; }
+			printf("out of range: %d\n", out);
+			for (int test = 0; test < 9; test ++) {
 				std::string test_name;
 				cudaMemcpy(gtab, tab, N*sizeof(double), cudaMemcpyHostToDevice);
 				for (int rep=0; rep<1; rep++) {
@@ -210,12 +213,15 @@ int main () {
 					cudaMemcpy(ghist, hist, M*sizeof(double), cudaMemcpyHostToDevice);
 					cudaEventRecord(start);
 					switch (test) {
-						case 0: test_name = "atomicAdd"; test0<<<blx,thx>>>(gtab, N, ghist); break;
-						case 1: test_name = "for atomicAdd"; test1<<<blx,thx>>>(gtab, N, ghist); break;
-						case 2: test_name = "for atomicSum"; test2<<<blx,thx>>>(gtab, N, ghist); break;
-						case 3: test_name = "for atomicSumWarp"; test3<<<blx,thx>>>(gtab, N, ghist); break;
-						case 4: test_name = "for atomicSumWarp (__any)"; test4<<<blx,thx>>>(gtab, N, ghist); break;
-						case 5: test_name = "for atomicSumWarpX (__any)"; test5<<<blx,thx>>>(gtab, N, ghist); break;
+						case 0: test_name = "    atomicAdd"; DirectCall< direct_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 1: test_name = "for atomicAdd"; ForCall< direct_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 2: test_name = "for atomicSum"; ForCall< block_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 3: test_name = "for atomicSumWarp"; ForCall< warp_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 4: test_name = "for atomicSumWarp (__any)"; ForCall< warp_any_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 5: test_name = "for atomicSumWarpX (__any)"; ForCall< warp_xor_any_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 6: test_name = "for atomicSum (cg)"; ForCall< cg_block_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 7: test_name = "for atomicSum (cg)"; ForCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 8: test_name = "    atomicSum (cg)"; DirectCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
 					}
 					cudaEventRecord(stop);
 					cudaEventSynchronize(stop);

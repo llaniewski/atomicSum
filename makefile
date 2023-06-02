@@ -2,4 +2,4 @@ all : main
 	./main
 
 main : main.cu
-	nvcc -o $@ $<
+	nvcc -arch=compute_75 -o $@ $<
