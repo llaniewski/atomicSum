@@ -6,6 +6,7 @@
 #include <string>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cuda/atomic>
 namespace cg = cooperative_groups;
 
 #if __CUDA_ARCH__ < 200
@@ -220,8 +221,8 @@ int main () {
 						case 4: test_name = "for atomicSumWarp (__any)"; ForCall< warp_any_sum > <<<blx,thx>>>(gtab, N, ghist); break;
 						case 5: test_name = "for atomicSumWarpX (__any)"; ForCall< warp_xor_any_sum > <<<blx,thx>>>(gtab, N, ghist); break;
 						case 6: test_name = "for atomicSum (cg)"; ForCall< cg_block_sum > <<<blx,thx>>>(gtab, N, ghist); break;
-						case 7: test_name = "for atomicSum (cg)"; ForCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
-						case 8: test_name = "    atomicSum (cg)"; DirectCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 7: test_name = "for atomicSum (cg, lab)"; ForCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
+						case 8: test_name = "    atomicSum (cg, lab)"; DirectCall< cg_block_part_lab_sum > <<<blx,thx>>>(gtab, N, ghist); break;
 					}
 					cudaEventRecord(stop);
 					cudaEventSynchronize(stop);
