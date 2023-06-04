@@ -106,8 +106,6 @@ __device__ static inline void atomicSum(double * sum, double val)
 struct cg_block_sum {
 __device__ static inline void atomicSum(double * sum, double val) {
 	cg::coalesced_group active = cg::coalesced_threads();
-	//cg::thread_block active = cg::this_thread_block();
-	//cg::labeled_partition(active, sum);
 	double val2 = cg::reduce(active, val, cg::plus<double>());
 	if (active.thread_rank() == 0)  atomicAddP(sum,val2);
 }
@@ -117,7 +115,7 @@ __device__ static inline void atomicSum(double * sum, double val) {
 struct cg_block_part_lab_sum {
 __device__ static inline void atomicSum(double * sum, double val) {
 	cg::coalesced_group active = cg::coalesced_threads();
-	cg::coalesced_group com = cg::labeled_partition(active, (unsigned long long)(void*)sum);
+	cg::coalesced_group com = cg::labeled_partition(active, (unsigned long long)(void*)sum);	
 	double val2 = cg::reduce(com, val, cg::plus<double>());
 	if (com.thread_rank() == 0)  atomicAddP(sum,val2);
 }
@@ -147,19 +145,21 @@ __host__ __device__ int bin(double x) {
 template < class T >
 __global__ void DirectCall(double* tab, int N, double * hist) {
 	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
-	double val = 1.0;
+	double x = tab[i];
+	int j = bin(x);
+	double val = x;
 	if (j != -1) T::atomicSum(&hist[j],val);
 }
 
 template < class T >
 __global__ void ForCall(double* tab, int N, double * hist) {
 	int i = threadIdx.x + blockDim.x*( threadIdx.y + blockDim.y*( blockIdx.x ) );
-	int j = bin(tab[i]);
+	double x = tab[i];
+	int j = bin(x);
 	double val;
 	for (int k=0; k<M; k++) {
 		if (j == k) {
-			val = 1.0;
+			val = x;
 		} else {
 			val = 0.0;
 		}
@@ -204,7 +204,7 @@ int main () {
 			}
 			for (int i=0; i<M; i++) chist[i] = 0;
 			int out=0;
-			for (int i=0; i<N; i++) { int j = bin(tab[i]); if (j != -1) chist[j]++; else out++; }
+			for (int i=0; i<N; i++) { double x = tab[i]; int j = bin(x); if (j != -1) chist[j] = chist[j] + x; else out++; }
 			printf("out of range: %d\n", out);
 			for (int test = 0; test < 9; test ++) {
 				std::string test_name;
@@ -230,7 +230,10 @@ int main () {
 					cudaEventElapsedTime(&milliseconds, start, stop);
 					cudaMemcpy(hist, ghist, M*sizeof(double), cudaMemcpyDeviceToHost);
 					bool good = true;
-					for (int i=0; i<M; i++) if (fabs(hist[i] - chist[i]) > 1e-10) { good = false; break; }
+					double eps=0;
+					for (int i=0; i<M; i++) { double neps = fabs(hist[i] - chist[i]); if (neps > eps) eps = neps; }
+					printf("%4.2lg --- ", eps);
+					good = (eps < 1.0e-5);
 					if (good) printf("[ GOOD ]"); else printf("[ BAD  ]");
 					printf(" --- %10.2f ms --- %s - %s\n", milliseconds, dist_name.c_str(), test_name.c_str());
 				}
